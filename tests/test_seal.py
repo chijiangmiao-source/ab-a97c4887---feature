@@ -13,7 +13,7 @@ from app.server import build_server
 from app.service import ApiError
 from app.store import Store
 
-from .helpers import generate_keys, sign, signature_entry
+from .helpers import generate_keys, signature_entry
 
 GENESIS = crypto.GENESIS_DIGEST
 

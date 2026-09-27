@@ -88,11 +88,13 @@ def create_group(store: Store, body: dict) -> tuple[int, dict]:
 
     if not store.create_group(group_id, threshold, parsed):
         raise ApiError(409, "group_exists", f"group {group_id!r} is already registered")
+    log_size, log_root = store.get_log_state(group_id)
     return 201, {
         "group_id": group_id,
         "threshold": threshold,
         "key_ids": [fp for fp, _ in parsed],
         "head": {"seq": 0, "digest": crypto.GENESIS_DIGEST},
+        "log": {"size": log_size, "root_hash": log_root},
     }
 
 
@@ -101,18 +103,68 @@ def get_group(store: Store, group_id: str) -> tuple[int, dict]:
     if group is None:
         raise ApiError(404, "unknown_group", f"no seal group {group_id!r}")
     seq, digest = store.get_head(group_id)
+    log_size, log_root = store.get_log_state(group_id)
     return 200, {
         "group_id": group_id,
         "threshold": group["threshold"],
         "key_ids": sorted(group["keys"]),
         "head": {"seq": seq, "digest": digest},
+        "log": {"size": log_size, "root_hash": log_root},
     }
 
 
 def list_packages(store: Store, group_id: str) -> tuple[int, dict]:
     if store.get_group(group_id) is None:
         raise ApiError(404, "unknown_group", f"no seal group {group_id!r}")
-    return 200, {"group_id": group_id, "packages": store.list_packages(group_id)}
+    log_size, log_root = store.get_log_state(group_id)
+    return 200, {
+        "group_id": group_id,
+        "packages": store.list_packages(group_id),
+        "log": {"size": log_size, "root_hash": log_root},
+    }
+
+
+def _require_size(params: dict, field: str) -> int:
+    raw = params.get(field)
+    if raw is None:
+        raise ApiError(400, f"bad_{field}", f"query parameter {field} is required")
+    # Strict: only ASCII non-negative decimal integers, no signs/whitespace.
+    if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit():
+        raise ApiError(400, f"bad_{field}", f"{field} must be a non-negative integer")
+    return int(raw)
+
+
+def get_consistency(store: Store, group_id: str, params: dict) -> tuple[int, dict]:
+    """RFC 9162 consistency proof between two confirmed log sizes.
+
+    ``first == 0`` (empty prefix) and ``first == second`` get deterministic
+    empty-path answers; sizes beyond the confirmed log are rejected.
+    """
+    current = store.get_log_state(group_id)
+    if current is None:
+        raise ApiError(404, "unknown_group", f"no seal group {group_id!r}")
+    first = _require_size(params, "first")
+    second = _require_size(params, "second")
+    if first > second:
+        raise ApiError(
+            400, "bad_size_order",
+            f"first ({first}) must be <= second ({second})",
+        )
+    current_size, _ = current
+    if second > current_size:
+        raise ApiError(
+            409, "log_size_out_of_range",
+            f"second ({second}) exceeds confirmed log size {current_size}",
+        )
+    first_root, second_root, proof = store.get_consistency(group_id, first, second)
+    return 200, {
+        "group_id": group_id,
+        "first_size": first,
+        "second_size": second,
+        "first_root_hash": first_root,
+        "second_root_hash": second_root,
+        "consistency": proof,
+    }
 
 
 def submit_package(store: Store, group_id: str, body: dict) -> tuple[int, dict]:

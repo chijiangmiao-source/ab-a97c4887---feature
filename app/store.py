@@ -14,6 +14,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
+from . import merkle
 from .crypto import GENESIS_DIGEST
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,23 @@ CREATE TABLE IF NOT EXISTS heads (
     head_seq    INTEGER NOT NULL,
     head_digest TEXT NOT NULL
 );
+-- Per-group append-only Merkle log (RFC 9162): one leaf per confirmed
+-- package. Leaves and the cumulative root are written in the SAME commit
+-- as the package/receipt/head, so the log can never disagree with the
+-- confirmed history.
+CREATE TABLE IF NOT EXISTS log_leaves (
+    group_id  TEXT NOT NULL REFERENCES groups(group_id),
+    log_seq   INTEGER NOT NULL,          -- 1-based position in the log
+    pkg_seq   INTEGER NOT NULL,
+    leaf_hash TEXT NOT NULL,             -- RFC 9162 leaf hash (hex)
+    PRIMARY KEY (group_id, log_seq),
+    UNIQUE (group_id, pkg_seq)
+);
+CREATE TABLE IF NOT EXISTS log_state (
+    group_id  TEXT PRIMARY KEY REFERENCES groups(group_id),
+    log_size  INTEGER NOT NULL,          -- number of leaves
+    root_hash TEXT NOT NULL              -- MTH over all leaves (hex)
+);
 """
 
 
@@ -85,6 +103,7 @@ class Store:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._rebuild_heads()
+            self._rebuild_logs()
 
     def close(self) -> None:
         with self._lock:
@@ -125,6 +144,69 @@ class Store:
             self._conn.execute("ROLLBACK")
             raise
 
+    def _rebuild_logs(self) -> None:
+        """Rebuild every group's Merkle log solely from confirmed packages.
+
+        After a restart the leaf list and the cumulative root are
+        recomputed from the durable ``packages`` rows (ordered by seq), so
+        the recovered root and every consistency proof are byte-identical
+        to the ones served before the restart.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            group_ids = [
+                r["group_id"] for r in self._conn.execute("SELECT group_id FROM groups")
+            ]
+            for gid in group_ids:
+                rows = self._conn.execute(
+                    "SELECT seq, digest, op_id FROM packages"
+                    " WHERE group_id=? ORDER BY seq",
+                    (gid,),
+                ).fetchall()
+                self._conn.execute(
+                    "DELETE FROM log_leaves WHERE group_id=?", (gid,)
+                )
+                leaves: list[bytes] = []
+                for i, row in enumerate(rows, start=1):
+                    lh = merkle.leaf_hash(gid, row["seq"], row["digest"])
+                    leaves.append(bytes.fromhex(lh))
+                    self._conn.execute(
+                        "INSERT INTO log_leaves (group_id, log_seq, pkg_seq, leaf_hash)"
+                        " VALUES (?,?,?,?)",
+                        (gid, i, row["seq"], lh),
+                    )
+                    # Backfill receipts written before the log existed: attach
+                    # the immutable as-of-commit snapshot they correspond to.
+                    receipt = self._conn.execute(
+                        "SELECT response_json FROM receipts"
+                        " WHERE group_id=? AND op_id=?",
+                        (gid, row["op_id"]),
+                    ).fetchone()
+                    if receipt is not None:
+                        payload = json.loads(receipt["response_json"])
+                        if "log" not in payload:
+                            payload["log"] = {"size": i, "root_hash": merkle.root(leaves).hex()}
+                            self._conn.execute(
+                                "UPDATE receipts SET response_json=? WHERE group_id=? AND op_id=?",
+                                (json.dumps(payload), gid, row["op_id"]),
+                            )
+                root_hash = merkle.root(leaves).hex()
+                self._conn.execute(
+                    "INSERT INTO log_state (group_id, log_size, root_hash) VALUES (?,?,?)"
+                    " ON CONFLICT(group_id) DO UPDATE SET"
+                    " log_size=excluded.log_size, root_hash=excluded.root_hash",
+                    (gid, len(rows), root_hash),
+                )
+                if rows:
+                    log.info(
+                        "recovered merkle log: group=%s size=%d root=%s…",
+                        gid, len(rows), root_hash[:16],
+                    )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
     # -- groups -------------------------------------------------------------
     def create_group(self, group_id: str, threshold: int, keys: list[tuple[str, str]]) -> bool:
         """Register a seal group. Returns False if the group id already exists."""
@@ -147,6 +229,10 @@ class Store:
                 self._conn.execute(
                     "INSERT INTO heads (group_id, head_seq, head_digest) VALUES (?,?,?)",
                     (group_id, 0, GENESIS_DIGEST),
+                )
+                self._conn.execute(
+                    "INSERT INTO log_state (group_id, log_size, root_hash) VALUES (?,?,?)",
+                    (group_id, 0, merkle.EMPTY_ROOT_HASH),
                 )
                 self._conn.execute("COMMIT")
                 return True
@@ -202,6 +288,47 @@ class Store:
                 }
                 for r in rows
             ]
+
+    # -- Merkle log ----------------------------------------------------------
+    def get_log_state(self, group_id: str) -> tuple[int, str] | None:
+        """Current (size, root_hash) of the group's Merkle log; None if unknown."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT log_size, root_hash FROM log_state WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+            return (row["log_size"], row["root_hash"]) if row else None
+
+    def _log_leaves_locked(self, group_id: str) -> list[bytes]:
+        rows = self._conn.execute(
+            "SELECT leaf_hash FROM log_leaves WHERE group_id=? ORDER BY log_seq",
+            (group_id,),
+        ).fetchall()
+        return [bytes.fromhex(r["leaf_hash"]) for r in rows]
+
+    def get_consistency(
+        self, group_id: str, first: int, second: int
+    ) -> tuple[str, str, list[str]]:
+        """Return (first_root, second_root, proof_hashes) for sizes first<=second.
+
+        Reads are served inside the same serialising lock as commits, so
+        the roots and proof always describe one coherent prefix of the log.
+        """
+        with self._lock:
+            state = self._conn.execute(
+                "SELECT log_size FROM log_state WHERE group_id=?", (group_id,)
+            ).fetchone()
+            if state is None:
+                raise KeyError(group_id)
+            if not (0 <= first <= second <= state["log_size"]):
+                raise ValueError((first, second, state["log_size"]))
+            leaves = self._log_leaves_locked(group_id)
+            first_root = merkle.root(leaves[:first]).hex()
+            second_root = merkle.root(leaves[:second]).hex()
+            proof = [
+                h.hex() for h in merkle.consistency_proof(leaves[:second], first, second)
+            ]
+            return first_root, second_root, proof
 
     # -- package submission -------------------------------------------------
     def submit_package(
@@ -261,12 +388,40 @@ class Store:
                                 json.dumps(signer_ids), _now(),
                             ),
                         )
+                        # Append the domain-separated Merkle leaf and save
+                        # the recomputable cumulative root in THIS commit, so
+                        # package/receipt/head/log always move together.
+                        lh = merkle.leaf_hash(group_id, seq, digest)
+                        size_row = self._conn.execute(
+                            "SELECT log_size FROM log_state WHERE group_id=?",
+                            (group_id,),
+                        ).fetchone()
+                        new_size = size_row["log_size"] + 1
+                        self._conn.execute(
+                            "INSERT INTO log_leaves (group_id, log_seq, pkg_seq, leaf_hash)"
+                            " VALUES (?,?,?,?)",
+                            (group_id, new_size, seq, lh),
+                        )
+                        leaves = self._log_leaves_locked(group_id)
+                        new_root = merkle.root(leaves).hex()
+                        self._conn.execute(
+                            "UPDATE log_state SET log_size=?, root_hash=? WHERE group_id=?",
+                            (new_size, new_root, group_id),
+                        )
+                        # Persist the log snapshot AS OF this confirmation
+                        # inside the receipt: it is immutable, so an
+                        # idempotent replay (even after later packages)
+                        # returns the same size/root byte-for-byte.
+                        response = dict(
+                            response,
+                            log={"size": new_size, "root_hash": new_root},
+                        )
                         self._conn.execute(
                             "INSERT INTO receipts (group_id, op_id, request_hash,"
                             " response_json, created_at) VALUES (?,?,?,?,?)",
                             (group_id, op_id, request_hash, json.dumps(response), _now()),
                         )
-                        outcome = ("ok",)
+                        outcome = ("ok", response)
                 self._conn.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
                 self._conn.execute("ROLLBACK")
@@ -282,4 +437,4 @@ class Store:
             return json.loads(receipt["response_json"]), True
         if outcome[0] == "stale":
             raise StalePredecessor()
-        return response, False
+        return outcome[1], False
