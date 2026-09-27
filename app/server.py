@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import service
 from .service import ApiError
@@ -51,7 +51,9 @@ def _make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
 
         # -- routing --------------------------------------------------------
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
-            parts = [unquote(p) for p in urlsplit(self.path).path.split("/") if p]
+            split = urlsplit(self.path)
+            parts = [unquote(p) for p in split.path.split("/") if p]
+            query = parse_qs(split.query, keep_blank_values=True)
             try:
                 if parts == ["healthz"] or parts == ["health"]:
                     self._send_json(200, {"status": "ok"})
@@ -68,6 +70,14 @@ def _make_handler(store: Store) -> type[BaseHTTPRequestHandler]:
                     and parts[3] == "packages"
                 ):
                     status, payload = service.list_packages(store, parts[2])
+                    self._send_json(status, payload)
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[0] == "v1" and parts[1] == "groups"
+                    and parts[3] == "log" and parts[4] == "consistency"
+                ):
+                    status, payload = service.get_consistency(store, parts[2], query)
                     self._send_json(status, payload)
                     return
                 self._send_error(404, "not_found", f"no route for {self.path}")

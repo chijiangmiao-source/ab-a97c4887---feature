@@ -4,16 +4,25 @@
 Runs entirely over HTTP against a running seal server:
 
   0. waits for /healthz, builds + API smoke (group create, get)
-  1. threshold shortfall is rejected (422) and leaves history untouched
-  2. valid first package: digest/seq/unique head are exactly as expected
-  3. idempotent retransmission replays the same receipt, creates no history
-  4. same op_id with a changed payload conflicts (409)
-  5. concurrent submissions racing for the same predecessor: exactly one wins
+  1. threshold shortfall is rejected (422) and leaves history AND the
+     Merkle root untouched
+  2. valid first package: digest/seq/unique head are exactly as expected,
+     and the confirm response carries the log size + cumulative root
+  3. idempotent retransmission replays the same receipt, creates no
+     history and does not move the log
+  4. same op_id with a changed payload conflicts (409), log unmoved
+  5. concurrent submissions racing for the same predecessor: exactly one
+     wins, the log advances exactly once
+  6. Merkle consistency proofs: an independent RFC 6962 verifier (inline
+     below, hashlib only) confirms the old root is a prefix of the new
+     one, that tampered proofs FAIL verification, and that degenerate or
+     out-of-range requests get deterministic results
 
 Exits 0 only if every check passes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -85,6 +94,74 @@ def sig(priv, gid, prev, seq, config) -> str:
     return priv.sign(msg, ec.ECDSA(hashes.SHA256())).hex()
 
 
+# --------------------------------------------------------------------------
+# Independent RFC 6962 Merkle verifier — hashlib only, deliberately NOT
+# importing app.merkle: this is the downstream party that knows only an
+# old (size, root) pair, the new root and the proof, never the configs.
+# --------------------------------------------------------------------------
+
+LOG_LEAF_DOMAIN = b"LXe-ConfigSeal-Log/v1"
+EMPTY_ROOT = hashlib.sha256(b"").digest()
+
+
+def m_leaf(gid: str, seq: int, digest_hex: str) -> bytes:
+    g = gid.encode("utf-8")
+    data = (LOG_LEAF_DOMAIN + b"\x00" + len(g).to_bytes(2, "big") + g
+            + seq.to_bytes(8, "big") + bytes.fromhex(digest_hex))
+    return hashlib.sha256(b"\x00" + data).digest()
+
+
+def m_root(leaf_hashes: list[bytes]) -> bytes:
+    n = len(leaf_hashes)
+    if n == 0:
+        return EMPTY_ROOT
+    if n == 1:
+        return leaf_hashes[0]
+    k = 1 << (n.bit_length() - 1)
+    if k == n:
+        k >>= 1
+    return hashlib.sha256(b"\x01" + m_root(leaf_hashes[:k])
+                          + m_root(leaf_hashes[k:])).digest()
+
+
+def m_verify(m: int, n: int, first_root: bytes, second_root: bytes,
+             proof: list[bytes]) -> bool:
+    """RFC 9162 §2.1.4.2: is root(m) a prefix commitment of root(n)?"""
+    if m < 0 or m > n:
+        return False
+    if m == 0:
+        return proof == [] and first_root == EMPTY_ROOT
+    if m == n:
+        return proof == [] and first_root == second_root
+    path = [first_root, *proof] if m & (m - 1) == 0 else list(proof)
+    if not path:
+        return False
+    fn, sn = m - 1, n - 1
+    while fn & 1:
+        fn >>= 1
+        sn >>= 1
+    fr = sr = path[0]
+    for c in path[1:]:
+        if sn == 0:
+            return False
+        if fn & 1 or fn == sn:
+            fr = hashlib.sha256(b"\x01" + c + fr).digest()
+            sr = hashlib.sha256(b"\x01" + c + sr).digest()
+            while fn and not fn & 1:
+                fn >>= 1
+                sn >>= 1
+        else:
+            sr = hashlib.sha256(b"\x01" + sr + c).digest()
+        fn >>= 1
+        sn >>= 1
+    return sn == 0 and fr == first_root and sr == second_root
+
+
+def unhex_proof(resp: dict) -> tuple[bytes, bytes, list[bytes]]:
+    return (bytes.fromhex(resp["first_root"]), bytes.fromhex(resp["second_root"]),
+            [bytes.fromhex(x) for x in resp["proof"]])
+
+
 def package_body(keys, gid, op_id, prev, seq, config, idxs):
     return {
         "op_id": op_id, "prev_digest": prev, "seq": seq, "config": config,
@@ -109,6 +186,9 @@ def main() -> int:
         "group_id": gid, "threshold": 2, "public_keys": [k[2] for k in keys],
     })
     check("create seal group (2-of-4)", status == 201, f"status={status} body={group}")
+    check("new group starts with an empty log",
+          group.get("log") == {"size": 0, "root": EMPTY_ROOT.hex()},
+          f"log={group.get('log')}")
     status, info = call("GET", f"/v1/groups/{gid}")
     check("read group, genesis head", status == 200
           and info["head"] == {"seq": 0, "digest": crypto.GENESIS_DIGEST},
@@ -128,15 +208,27 @@ def main() -> int:
     check("tampered signature rejected", status == 422
           and err.get("error") == "invalid_signature", f"status={status} err={err}")
 
+    status, info = call("GET", f"/v1/groups/{gid}")
+    check("rejections left the Merkle log empty",
+          info.get("log") == {"size": 0, "root": EMPTY_ROOT.hex()},
+          f"log={info.get('log')}")
+
     # -- 2. valid first package ---------------------------------------------
     p1_body = package_body(keys, gid, "op-1", crypto.GENESIS_DIGEST, 1, "field=1500V", (0, 1))
     status, p1 = call("POST", f"/v1/groups/{gid}/packages", p1_body)
     expected1 = crypto.package_digest(gid, crypto.GENESIS_DIGEST, 1, "field=1500V")
     check("valid first package confirmed", status == 201 and p1["seq"] == 1
           and p1["digest"] == expected1, f"status={status} p1={p1}")
+    # the confirm response carries the log state; the root recomputes from
+    # the leaf alone (independent of the server's own merkle module)
+    root1 = m_root([m_leaf(gid, 1, expected1)]).hex()
+    check("confirm response carries log size + cumulative root",
+          p1.get("log") == {"size": 1, "root": root1}, f"log={p1.get('log')}")
     status, info = call("GET", f"/v1/groups/{gid}")
     check("unique chain head == package 1",
           info["head"] == {"seq": 1, "digest": expected1}, f"head={info.get('head')}")
+    check("group read carries the same log state",
+          info.get("log") == {"size": 1, "root": root1}, f"log={info.get('log')}")
 
     # -- 3. idempotent retransmission ---------------------------------------
     raw = json.dumps(p1_body).encode("utf-8")
@@ -145,9 +237,15 @@ def main() -> int:
           status == 200 and replay.get("replay") is True
           and replay["digest"] == expected1 and replay["seq"] == 1,
           f"status={status} replay={replay}")
+    check("replay carries the original log state",
+          replay.get("log") == {"size": 1, "root": root1},
+          f"log={replay.get('log')}")
     status, listing = call("GET", f"/v1/groups/{gid}/packages")
     check("retry wrote no extra history",
           len(listing["packages"]) == 1, f"n={len(listing['packages'])}")
+    check("retry did not move the log",
+          listing.get("log") == {"size": 1, "root": root1},
+          f"log={listing.get('log')}")
 
     # -- 4. op_id reused with a different payload conflicts -----------------
     # Properly signed, well-formed, but the op_id is already confirmed for a
@@ -157,6 +255,10 @@ def main() -> int:
     check("same op_id different payload conflicts",
           status == 409 and err.get("error") == "op_id_conflict",
           f"status={status} err={err}")
+    status, info = call("GET", f"/v1/groups/{gid}")
+    check("conflict did not move the log",
+          info.get("log") == {"size": 1, "root": root1},
+          f"log={info.get('log')}")
 
     # -- 5. concurrent race for the same predecessor ------------------------
     race_results: list[tuple[int, dict]] = []
@@ -195,11 +297,82 @@ def main() -> int:
           and listing["packages"][1]["digest"] == winner_digest,
           f"seqs={[p['seq'] for p in listing['packages']]}")
 
+    # the log advanced exactly once, to the winner's leaf; the cumulative
+    # root recomputes independently from the two confirmed packages
+    root2 = m_root([m_leaf(gid, p["seq"], p["digest"])
+                    for p in listing["packages"]]).hex()
+    check("log advanced exactly once, root recomputes from packages",
+          info.get("log") == {"size": 2, "root": root2}
+          and listing.get("log") == info.get("log")
+          and (winners[0].get("log") == info.get("log") if winners else False),
+          f"log={info.get('log')} expected_root={root2}")
+
+    # -- 6. Merkle consistency proofs ---------------------------------------
+    # Downstream recorded (size=1, root1) when package 1 was confirmed; now
+    # it fetches a proof and checks — with ONLY the two sizes, the two
+    # roots and the sibling digests — that the current history extends it.
+    status, pr = call("GET", f"/v1/groups/{gid}/log/consistency?first=1&second=2")
+    fr, sr, proof = unhex_proof(pr) if status == 200 else (b"", b"", [])
+    check("consistency proof 1->2 returns both recorded roots",
+          status == 200 and pr["first_root"] == root1
+          and pr["second_root"] == root2 and len(pr["proof"]) == 1,
+          f"status={status} pr={pr}")
+    check("independent verifier accepts the proof",
+          status == 200 and m_verify(1, 2, fr, sr, proof))
+
+    # tampered proofs MUST fail independent verification
+    if status == 200 and proof:
+        flipped = bytes([proof[0][0] ^ 1]) + proof[0][1:]
+        check("tampered sibling digest fails verification",
+              not m_verify(1, 2, fr, sr, [flipped]))
+        check("swapped roots fail verification",
+              not m_verify(1, 2, sr, fr, proof))
+        check("truncated proof fails verification",
+              not m_verify(1, 2, fr, sr, []))
+    else:
+        check("tampered sibling digest fails verification", False, "no proof fetched")
+        check("swapped roots fail verification", False, "no proof fetched")
+        check("truncated proof fails verification", False, "no proof fetched")
+
+    # empty prefix: the empty tree is a prefix of every history
+    status, pr = call("GET", f"/v1/groups/{gid}/log/consistency?first=0&second=2")
+    fr0, sr0, proof0 = unhex_proof(pr) if status == 200 else (b"", b"", [b""])
+    check("empty prefix: empty proof, empty-tree root",
+          status == 200 and pr["proof"] == []
+          and pr["first_root"] == EMPTY_ROOT.hex()
+          and pr["second_root"] == root2
+          and m_verify(0, 2, fr0, sr0, proof0),
+          f"status={status} pr={pr}")
+
+    # equal sizes: empty proof, identical roots
+    status, pr = call("GET", f"/v1/groups/{gid}/log/consistency?first=2&second=2")
+    check("equal sizes: empty proof, identical roots",
+          status == 200 and pr["proof"] == []
+          and pr["first_root"] == pr["second_root"] == root2,
+          f"status={status} pr={pr}")
+
+    # deterministic rejections
+    status, err = call("GET", f"/v1/groups/{gid}/log/consistency?first=2&second=1")
+    check("first > second rejected", status == 400
+          and err.get("error") == "bad_range", f"status={status} err={err}")
+    status, err = call("GET", f"/v1/groups/{gid}/log/consistency?first=1&second=99")
+    check("out-of-range size rejected", status == 409
+          and err.get("error") == "size_out_of_range", f"status={status} err={err}")
+    status, err = call("GET", f"/v1/groups/{gid}/log/consistency?first=abc&second=2")
+    check("non-numeric size rejected", status == 400
+          and err.get("error") == "bad_range", f"status={status} err={err}")
+    status, err = call("GET", f"/v1/groups/{gid}/log/consistency?first=1")
+    check("missing size rejected", status == 400
+          and err.get("error") == "bad_range", f"status={status} err={err}")
+    status, err = call("GET", "/v1/groups/no-such-group/log/consistency?first=0&second=0")
+    check("unknown group rejected", status == 404
+          and err.get("error") == "unknown_group", f"status={status} err={err}")
+
     print("-" * 60)
     if _failures:
         print(f"VERIFY FAILED ({len(_failures)} check(s)): {', '.join(_failures)}")
         return 1
-    print("VERIFY PASSED: all threshold/idempotency/chain-head checks OK")
+    print("VERIFY PASSED: all threshold/idempotency/chain-head/merkle checks OK")
     return 0
 
 

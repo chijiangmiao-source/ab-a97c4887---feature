@@ -8,7 +8,7 @@ import urllib.request
 
 import pytest
 
-from app import crypto, service
+from app import crypto, merkle, service
 from app.server import build_server
 from app.service import ApiError
 from app.store import Store
@@ -284,6 +284,245 @@ def test_concurrent_fork_exactly_one_winner(store, group):
     winner = results[0][1]
     assert service.get_group(store, gid)[1]["head"] == {"seq": 1, "digest": winner["digest"]}
     assert len(service.list_packages(store, gid)[1]["packages"]) == 1
+    # the Merkle log moved exactly once, to the winner's leaf alone
+    log = service.get_group(store, gid)[1]["log"]
+    assert log["size"] == 1
+    assert log["root"] == merkle.root_hex([merkle.leaf_hash_hex(gid, 1, winner["digest"])])
+
+
+# --------------------------------------------------------------------------
+# Merkle log: leaf append, cumulative root, consistency proofs
+# --------------------------------------------------------------------------
+
+def _log(store, gid):
+    return service.get_group(store, gid)[1]["log"]
+
+
+def _expected_root(store, gid, upto=None):
+    """Independently recompute the log root from the confirmed packages."""
+    packages = service.list_packages(store, gid)[1]["packages"][:upto]
+    return merkle.root_hex(
+        [merkle.leaf_hash_hex(gid, p["seq"], p["digest"]) for p in packages]
+    )
+
+
+def test_confirm_appends_leaf_and_reports_cumulative_root(store, group):
+    gid, keys = group
+    assert _log(store, gid) == {"size": 0, "root": merkle.EMPTY_ROOT_HEX}
+
+    status, p1 = _submit(store, gid, keys, "op-1", GENESIS, 1, "a")
+    assert status == 201
+    assert p1["log"] == {"size": 1, "root": _expected_root(store, gid)}
+    assert _log(store, gid) == p1["log"]
+
+    status, p2 = _submit(store, gid, keys, "op-2", p1["digest"], 2, "b")
+    assert status == 201
+    assert p2["log"] == {"size": 2, "root": _expected_root(store, gid)}
+    assert p2["log"]["root"] != p1["log"]["root"]
+
+    # every read interface carries the same log state
+    assert _log(store, gid) == p2["log"]
+    _, listing = service.list_packages(store, gid)
+    assert listing["log"] == p2["log"]
+
+
+def test_rejected_and_replayed_submissions_do_not_change_root(store, group):
+    gid, keys = group
+    body = {
+        "op_id": "op-1", "prev_digest": GENESIS, "seq": 1, "config": "cfg",
+        "signatures": [signature_entry(keys[i][0], keys[i][1], gid, GENESIS, 1, "cfg")
+                       for i in (0, 1)],
+    }
+    status, first = service.submit_package(store, gid, body)
+    assert status == 201
+    log1 = _log(store, gid)
+    assert first["log"] == log1
+
+    # stateless validation failure (threshold shortfall)
+    with pytest.raises(ApiError):
+        _submit(store, gid, keys, "op-thin", GENESIS, 1, "x", signers=(0,))
+    # invalid signature (signed over different fields)
+    with pytest.raises(ApiError):
+        service.submit_package(store, gid, {
+            "op_id": "op-bad", "prev_digest": GENESIS, "seq": 1, "config": "x",
+            "signatures": [signature_entry(keys[i][0], keys[i][1], gid, GENESIS, 2, "x")
+                           for i in (0, 1)],
+        })
+    # stale predecessor (loses against the confirmed head)
+    with pytest.raises(ApiError):
+        _submit(store, gid, keys, "op-stale", GENESIS, 1, "x")
+    # op_id conflict
+    with pytest.raises(ApiError):
+        _submit(store, gid, keys, "op-1", GENESIS, 1, "tampered")
+    assert _log(store, gid) == log1
+
+    # idempotent retransmission: same receipt, same log, no new leaf
+    status, replay = service.submit_package(store, gid, json.loads(json.dumps(body)))
+    assert status == 200 and replay["replay"] is True
+    assert replay["log"] == log1
+    assert _log(store, gid) == log1
+    assert len(service.list_packages(store, gid)[1]["packages"]) == 1
+
+
+def test_race_loser_does_not_change_root(store, group):
+    gid, keys = group
+    results, errors = [], []
+
+    def attempt(i):
+        try:
+            results.append(_submit(store, gid, keys, f"op-{i}", GENESIS, 1, f"cfg-{i}"))
+        except ApiError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 1 and len(errors) == 7
+    winner = results[0][1]
+    # the log moved exactly once, to the winner's leaf alone
+    assert _log(store, gid) == {
+        "size": 1,
+        "root": merkle.root_hex([merkle.leaf_hash_hex(gid, 1, winner["digest"])]),
+    }
+    assert winner["log"] == _log(store, gid)
+
+
+def test_restart_rebuilds_same_root_and_proofs(tmp_path):
+    db = str(tmp_path / "seal.db")
+    s1 = Store(db)
+    keys = generate_keys(3)
+    service.create_group(s1, {"group_id": "g", "threshold": 2,
+                              "public_keys": [k[2] for k in keys]})
+    _, p1 = _submit(s1, "g", keys, "op-1", GENESIS, 1, "a")
+    _, p2 = _submit(s1, "g", keys, "op-2", p1["digest"], 2, "b")
+    _, p3 = _submit(s1, "g", keys, "op-3", p2["digest"], 3, "c")
+    log_before = _log(s1, "g")
+    _, proof_before = service.get_consistency(s1, "g", {"first": ["1"], "second": ["3"]})
+    s1.close()
+
+    # restart: root and proofs are rebuilt from confirmed packages alone
+    s2 = Store(db)
+    try:
+        assert _log(s2, "g") == log_before
+        _, proof_after = service.get_consistency(s2, "g", {"first": ["1"], "second": ["3"]})
+        assert proof_after == proof_before
+        # and the log keeps extending from the rebuilt root
+        status, p4 = _submit(s2, "g", keys, "op-4", p3["digest"], 4, "d")
+        assert status == 201
+        assert p4["log"] == {"size": 4, "root": _expected_root(s2, "g")}
+    finally:
+        s2.close()
+
+
+def _verify_hex(m, n, proof_resp):
+    return merkle.verify_consistency(
+        m, n,
+        bytes.fromhex(proof_resp["first_root"]),
+        bytes.fromhex(proof_resp["second_root"]),
+        [bytes.fromhex(x) for x in proof_resp["proof"]],
+    )
+
+
+def test_consistency_proof_ranges(store, group):
+    gid, keys = group
+    # empty log: only the (0, 0) range exists
+    status, pr = service.get_consistency(store, gid, {"first": ["0"], "second": ["0"]})
+    assert status == 200
+    assert pr["first_root"] == pr["second_root"] == merkle.EMPTY_ROOT_HEX
+    assert pr["proof"] == []
+    with pytest.raises(ApiError) as e:
+        service.get_consistency(store, gid, {"first": ["0"], "second": ["1"]})
+    assert _err(e) == (409, "size_out_of_range")
+
+    prev = GENESIS
+    for seq in range(1, 6):
+        _, p = _submit(store, gid, keys, f"op-{seq}", prev, seq, f"cfg-{seq}")
+        prev = p["digest"]
+
+    # empty prefix: empty proof, first root is the empty-tree hash
+    _, pr = service.get_consistency(store, gid, {"first": ["0"], "second": ["5"]})
+    assert pr["proof"] == []
+    assert pr["first_root"] == merkle.EMPTY_ROOT_HEX
+    assert pr["second_root"] == _log(store, gid)["root"]
+    assert _verify_hex(0, 5, pr)
+
+    # full range from the first leaf
+    _, pr = service.get_consistency(store, gid, {"first": ["1"], "second": ["5"]})
+    assert _verify_hex(1, 5, pr)
+
+    # non-power-of-two boundary exercises the unbalanced split
+    _, pr = service.get_consistency(store, gid, {"first": ["3"], "second": ["5"]})
+    assert pr["first_root"] == merkle.root_hex(
+        [merkle.leaf_hash_hex(gid, p["seq"], p["digest"])
+         for p in service.list_packages(store, gid)[1]["packages"][:3]]
+    )
+    assert _verify_hex(3, 5, pr)
+    # a tampered sibling digest must fail independent verification
+    bad = dict(pr, proof=[("00" if not pr["proof"][0].startswith("00") else "01")
+                          + pr["proof"][0][2:], *pr["proof"][1:]])
+    assert not _verify_hex(3, 5, bad)
+
+    # equal sizes: empty proof, identical roots
+    _, pr = service.get_consistency(store, gid, {"first": ["2"], "second": ["2"]})
+    assert pr["proof"] == [] and pr["first_root"] == pr["second_root"]
+    assert _verify_hex(2, 2, pr)
+
+
+def test_consistency_proof_rejections(store, group):
+    gid, keys = group
+    _submit(store, gid, keys, "op-1", GENESIS, 1, "a")
+
+    # first > second
+    with pytest.raises(ApiError) as e:
+        service.get_consistency(store, gid, {"first": ["2"], "second": ["1"]})
+    assert _err(e) == (400, "bad_range")
+    # beyond the confirmed log size
+    with pytest.raises(ApiError) as e:
+        service.get_consistency(store, gid, {"first": ["1"], "second": ["99"]})
+    assert _err(e) == (409, "size_out_of_range")
+    # malformed queries
+    for query in (
+        {"second": ["1"]},                            # missing first
+        {"first": ["1"]},                             # missing second
+        {"first": ["x"], "second": ["1"]},            # not a number
+        {"first": ["-1"], "second": ["1"]},           # negative
+        {"first": ["1.5"], "second": ["2"]},          # not an integer
+        {"first": ["1", "1"], "second": ["1"]},       # repeated parameter
+        {"first": [""], "second": ["1"]},             # blank
+    ):
+        with pytest.raises(ApiError) as e:
+            service.get_consistency(store, gid, query)
+        assert _err(e) == (400, "bad_range"), query
+    # unknown group: a proof can never span groups
+    with pytest.raises(ApiError) as e:
+        service.get_consistency(store, "no-such-group", {"first": ["0"], "second": ["0"]})
+    assert _err(e) == (404, "unknown_group")
+
+
+def test_consistency_proof_is_group_scoped(store):
+    keys = generate_keys(2)
+    pubs = [k[2] for k in keys]
+    for gid in ("g-a", "g-b"):
+        status, _ = service.create_group(store, {
+            "group_id": gid, "threshold": 2, "public_keys": pubs,
+        })
+        assert status == 201
+    _, a1 = _submit(store, "g-a", keys, "op-1", GENESIS, 1, "a-1")
+    _submit(store, "g-a", keys, "op-2", a1["digest"], 2, "a-2")
+    _, b1 = _submit(store, "g-b", keys, "op-1", GENESIS, 1, "b-1")
+    _submit(store, "g-b", keys, "op-2", b1["digest"], 2, "b-2")
+
+    _, pra = service.get_consistency(store, "g-a", {"first": ["1"], "second": ["2"]})
+    _, prb = service.get_consistency(store, "g-b", {"first": ["1"], "second": ["2"]})
+    # the group id is bound into every leaf, so the histories differ
+    assert pra["second_root"] != prb["second_root"]
+    assert _verify_hex(1, 2, pra) and _verify_hex(1, 2, prb)
+    # a proof from one group can never validate against the other's root
+    crossed = dict(pra, second_root=prb["second_root"])
+    assert not _verify_hex(1, 2, crossed)
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +579,29 @@ def test_http_end_to_end(tmp_path):
         }
         status, err = call("POST", "/v1/groups/http-g/packages", stale)
         assert status == 409 and err["error"] == "stale_predecessor"
+
+        # the stale attempt did not move the Merkle log
+        status, info = call("GET", "/v1/groups/http-g")
+        assert status == 200 and info["log"] == pkg["log"] == {"size": 1, "root": pkg["log"]["root"]}
+
+        # consistency proof over HTTP: empty prefix and full range
+        status, pr = call("GET", "/v1/groups/http-g/log/consistency?first=0&second=1")
+        assert status == 200 and pr["proof"] == []
+        assert pr["first_root"] == merkle.EMPTY_ROOT_HEX
+        assert pr["second_root"] == info["log"]["root"]
+        status, pr = call("GET", "/v1/groups/http-g/log/consistency?first=1&second=1")
+        assert status == 200 and pr["proof"] == []
+        assert pr["first_root"] == pr["second_root"] == info["log"]["root"]
+
+        # deterministic rejections over HTTP
+        status, err = call("GET", "/v1/groups/http-g/log/consistency?first=2&second=1")
+        assert status == 400 and err["error"] == "bad_range"
+        status, err = call("GET", "/v1/groups/http-g/log/consistency?first=0&second=99")
+        assert status == 409 and err["error"] == "size_out_of_range"
+        status, err = call("GET", "/v1/groups/http-g/log/consistency?first=abc&second=1")
+        assert status == 400 and err["error"] == "bad_range"
+        status, err = call("GET", "/v1/groups/nope/log/consistency?first=0&second=0")
+        assert status == 404 and err["error"] == "unknown_group"
     finally:
         httpd.shutdown()
         httpd.server_close()

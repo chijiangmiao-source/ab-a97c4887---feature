@@ -2,9 +2,9 @@
 
 All state-changing work for a submission happens inside ONE ``BEGIN
 IMMEDIATE`` transaction: idempotency-receipt lookup, chain-head check,
-package insert, receipt insert and head move. Competing writers are
-serialised by the database write lock, so at most one request can ever
-extend a given predecessor.
+package insert, Merkle leaf append + cumulative root save, receipt
+insert and head move. Competing writers are serialised by the database
+write lock, so at most one request can ever extend a given predecessor.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
+from . import merkle
 from .crypto import GENESIS_DIGEST
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,24 @@ CREATE TABLE IF NOT EXISTS heads (
     head_seq    INTEGER NOT NULL,
     head_digest TEXT NOT NULL
 );
+-- Append-only Merkle log over confirmed packages (RFC 6962). Leaf index
+-- is seq - 1: the log and the chain are the same linear history. Both
+-- tables are derived state — they are rebuilt from `packages` on every
+-- startup and appended to only inside the confirmation transaction.
+CREATE TABLE IF NOT EXISTS merkle_leaves (
+    group_id   TEXT NOT NULL REFERENCES groups(group_id),
+    leaf_index INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    leaf_hash  TEXT NOT NULL,       -- hex of SHA-256(0x00 || leaf_input)
+    PRIMARY KEY (group_id, leaf_index),
+    UNIQUE (group_id, seq)
+);
+CREATE TABLE IF NOT EXISTS merkle_roots (
+    group_id  TEXT NOT NULL REFERENCES groups(group_id),
+    tree_size INTEGER NOT NULL,     -- cumulative root after this many leaves
+    root      TEXT NOT NULL,        -- hex, recomputable from merkle_leaves
+    PRIMARY KEY (group_id, tree_size)
+);
 """
 
 
@@ -92,10 +111,12 @@ class Store:
 
     # -- recovery ---------------------------------------------------------
     def _rebuild_heads(self) -> None:
-        """Derive every group's unique chain head from confirmed packages.
+        """Derive every group's head and Merkle log from confirmed packages.
 
-        Runs on every startup: after a restart the chain head is recovered
-        from the durable package records, never from stale side state.
+        Runs on every startup: after a restart the chain head and the
+        Merkle log are recovered from the durable package records, never
+        from stale side state, so the rebuilt cumulative root and any
+        consistency proof are bit-identical to the pre-restart ones.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -120,10 +141,46 @@ class Store:
                         "recovered chain head: group=%s seq=%d digest=%s…",
                         gid, seq, digest[:16],
                     )
+                self._rebuild_merkle(gid)
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
             raise
+
+    def _rebuild_merkle(self, group_id: str) -> None:
+        """Re-derive the group's Merkle leaves and cumulative roots.
+
+        ``packages`` is the source of truth; the leaf input is a pure
+        function of (group_id, seq, digest), so replaying the confirmed
+        chain always reproduces the same leaves, roots and proofs.
+        """
+        rows = self._conn.execute(
+            "SELECT seq, digest FROM packages WHERE group_id=? ORDER BY seq",
+            (group_id,),
+        ).fetchall()
+        self._conn.execute("DELETE FROM merkle_leaves WHERE group_id=?", (group_id,))
+        self._conn.execute("DELETE FROM merkle_roots WHERE group_id=?", (group_id,))
+        hashes: list[str] = []
+        for row in rows:
+            hashes.append(merkle.leaf_hash_hex(group_id, row["seq"], row["digest"]))
+            self._conn.execute(
+                "INSERT INTO merkle_leaves (group_id, leaf_index, seq, leaf_hash)"
+                " VALUES (?,?,?,?)",
+                (group_id, row["seq"] - 1, row["seq"], hashes[-1]),
+            )
+            # Chain sizes here are small (one leaf per confirmed config
+            # package), so recomputing the cumulative root from the leaf
+            # prefix is cheap and keeps the stored root honest by
+            # construction.
+            self._conn.execute(
+                "INSERT INTO merkle_roots (group_id, tree_size, root) VALUES (?,?,?)",
+                (group_id, row["seq"], merkle.root_hex(hashes)),
+            )
+        if hashes:
+            log.info(
+                "recovered merkle root: group=%s size=%d root=%s…",
+                group_id, len(hashes), merkle.root_hex(hashes)[:16],
+            )
 
     # -- groups -------------------------------------------------------------
     def create_group(self, group_id: str, threshold: int, keys: list[tuple[str, str]]) -> bool:
@@ -203,6 +260,31 @@ class Store:
                 for r in rows
             ]
 
+    # -- Merkle log reads ---------------------------------------------------
+    def get_log_state(self, group_id: str) -> tuple[int, str]:
+        """Current (size, cumulative root hex) of the group's Merkle log."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT tree_size, root FROM merkle_roots WHERE group_id=?"
+                " ORDER BY tree_size DESC LIMIT 1",
+                (group_id,),
+            ).fetchone()
+            if row is None:
+                return 0, merkle.EMPTY_ROOT_HEX
+            return row["tree_size"], row["root"]
+
+    def get_leaf_hashes(self, group_id: str, limit: int) -> list[str]:
+        """First ``limit`` leaf hashes (hex), in log order."""
+        with self._lock:
+            return [
+                r["leaf_hash"]
+                for r in self._conn.execute(
+                    "SELECT leaf_hash FROM merkle_leaves WHERE group_id=?"
+                    " ORDER BY leaf_index LIMIT ?",
+                    (group_id, limit),
+                )
+            ]
+
     # -- package submission -------------------------------------------------
     def submit_package(
         self,
@@ -220,8 +302,10 @@ class Store:
         """Confirm a package atomically.
 
         Inside a single persistent transaction: honour a prior idempotent
-        receipt, verify the current head, write the package, write the
-        idempotency receipt and move the head. Returns (response, replayed).
+        receipt, verify the current head, write the package, append the
+        Merkle leaf and save the cumulative root, write the idempotency
+        receipt and move the head. Returns (response, replayed); the
+        response carries the resulting log size and root.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -261,12 +345,41 @@ class Store:
                                 json.dumps(signer_ids), _now(),
                             ),
                         )
+                        # Merkle append in the SAME commit: leaf for
+                        # (group_id, seq, digest) plus the cumulative root.
+                        # A replayed, rejected or racing submission never
+                        # reaches this point, so it can never move the root.
+                        self._conn.execute(
+                            "INSERT INTO merkle_leaves"
+                            " (group_id, leaf_index, seq, leaf_hash) VALUES (?,?,?,?)",
+                            (
+                                group_id, seq - 1, seq,
+                                merkle.leaf_hash_hex(group_id, seq, digest),
+                            ),
+                        )
+                        hashes = [
+                            r["leaf_hash"]
+                            for r in self._conn.execute(
+                                "SELECT leaf_hash FROM merkle_leaves WHERE group_id=?"
+                                " ORDER BY leaf_index",
+                                (group_id,),
+                            )
+                        ]
+                        log_root = merkle.root_hex(hashes)
+                        self._conn.execute(
+                            "INSERT INTO merkle_roots (group_id, tree_size, root)"
+                            " VALUES (?,?,?)",
+                            (group_id, seq, log_root),
+                        )
+                        response = dict(
+                            response, log={"size": seq, "root": log_root}
+                        )
                         self._conn.execute(
                             "INSERT INTO receipts (group_id, op_id, request_hash,"
                             " response_json, created_at) VALUES (?,?,?,?,?)",
                             (group_id, op_id, request_hash, json.dumps(response), _now()),
                         )
-                        outcome = ("ok",)
+                        outcome = ("ok", response)
                 self._conn.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
                 self._conn.execute("ROLLBACK")
@@ -282,4 +395,4 @@ class Store:
             return json.loads(receipt["response_json"]), True
         if outcome[0] == "stale":
             raise StalePredecessor()
-        return response, False
+        return outcome[1], False
